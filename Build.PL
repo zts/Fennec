@@ -8,36 +8,30 @@ my $build = Module::Build->new(
     license     => 'perl',
     dist_author => 'Chad Granum <exodist7@gmail.com>',
     create_readme => 1,
-    script_files => "script",
     requires => {
-        # Core
-        'Benchmark'         => 0,
-        'Cwd'               => 0,
-        'Data::Dumper'      => 0,
-        'List::Util'        => 0,
+        'Carp'              => 0,
+        'Child'             => '0.010',
+        'Exporter::Declare' => 0,
+        'Mock::Quick'       => '1.106',
+        'Parallel::Runner'  => '0.013',
         'Scalar::Util'      => 0,
-        'Time::HiRes'       => 0,
-        'Digest::MD5'       => 0,
-        'File::Temp'        => 0,
-
-        # External
-        'List::MoreUtils'   => 0,
-        'Try::Tiny'         => 0,
-
-        # Made for Fennec
-        'Parallel::Runner'  => 0.006,
-        'Exporter::Declare' => 0.016,
+        'List::Util'        => 0,
+        'Test::Exception'   => '0.29',
+        'Test::Simple'      => '0.88',
+        'Test::Warn'        => 0,
     },
-    no_index => {
-        package   => [qw{ Test::Builder }],
-        namespace => [qw{ Test::Builder }],
+    recommends => {
+        'Fennec::Declare'   => '1.001',
+    },
+    build_requires => {
     },
     meta_merge => {
         resources => {
             repository  => 'http://github.com/exodist/Fennec',
             bugtracker  => 'http://github.com/exodist/Fennec/issues',
+            homepage    => 'http://exodist.github.io/Fennec/'
         },
-    }
+    },
 );
 
 $build->create_build_script;

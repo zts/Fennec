@@ -2,230 +2,271 @@ package Fennec::Runner;
 use strict;
 use warnings;
 
-use Fennec::Util::TBOverride;
-use Fennec::Util::Accessors;
-use Try::Tiny;
+use Fennec::Util qw/verbose_message/;
+
+BEGIN {
+    my @ltime = localtime;
+    $ltime[5] += 1900;
+    $ltime[4] += 1;      # months start at 0?
+    for ( 3, 4 ) {
+        $ltime[4] = "0$ltime[$_]" unless $ltime[$_] > 9;
+    }
+    my $seed = $ENV{FENNEC_SEED} || join( '', @ltime[5, 4, 3] );
+    verbose_message("\n*** Seeding random with date ($seed) ***\n");
+    srand($seed);
+}
+
+use Cwd qw/abs_path/;
+use Carp qw/carp croak confess/;
+use List::Util qw/shuffle/;
+use Scalar::Util qw/blessed/;
+use Fennec::Util qw/accessors require_module/;
+use Fennec::Collector::TB::TempFiles;
 use Parallel::Runner;
-use Carp;
 
-use Fennec::Util::Alias qw/
-    Fennec::Output::Diag
-    Fennec::Output::Result
-    Fennec::Runner::Proto
-/;
+accessors qw/pid test_classes collector _ran _skip_all/;
 
-use Digest::MD5 qw/md5_hex/;
-use List::Util  qw/shuffle/;
-use Time::HiRes qw/time/;
+my $SINGLETON;
+sub is_initialized { $SINGLETON ? 1 : 0 }
 
-Accessors qw/
-    files parallel_files parallel_tests threader ignore random pid parent_pid
-    collector search default_asserts default_workflows _benchmark_time seed
-    _started _finished finish_hooks bail_out root_workflow_class
-/;
+sub init { }
 
-our $SINGLETON;
+sub import {
+    my $self = shift->new();
+    return unless @_;
+    $self->_load_guess($_) for @_;
+    $self->inject_run( scalar caller );
+}
 
-sub alias { $SINGLETON }
+sub inject_run {
+    my $self = shift;
+    my ( $caller, $sub ) = @_;
 
-sub init {
-    my $class = shift;
-    croak( 'Fennec::Runner has already been initialized' )
-        if $SINGLETON;
+    $sub ||= sub { $self->run(@_) };
 
-    my $seed = $ENV{ FENNEC_SEED } || (( unpack "%L*", md5_hex( time * $$ )) ^ $$ );
-    srand( $seed );
+    require Fennec::Util;
+    Fennec::Util::inject_sub( $caller, 'run', $sub );
+}
 
-    $SINGLETON = Proto->new( @_, seed => $seed )
-                      ->rebless($class);
+sub new {
+    my $class  = shift;
+    my @caller = caller;
+
+    croak "listener_class is deprecated, it was thought nobody used it... sorry. See Fennec::Collector now"
+        if $class->can('listener_class');
+
+    croak "Runner was already initialized!"
+        if $SINGLETON && @_;
+
+    return $SINGLETON if $SINGLETON;
+
+    my %params = @_;
+
+    my $collector_class = $params{collector_class} || 'Fennec::Collector::TB::TempFiles';
+    my $collector = $collector_class->new();
+
+    $SINGLETON = bless(
+        {
+            test_classes => [],
+            pid          => $$,
+            collector    => $collector,
+        },
+        $class
+    );
+
+    $SINGLETON->init(%params);
 
     return $SINGLETON;
 }
 
-sub run_tests {
+sub _load_guess {
     my $self = shift;
-    $self->start;
+    my ($item) = @_;
 
-    for my $file ( @{ $self->files }) {
-        $self->collector->starting_file( $file->filename );
-
-        srand( $self->seed );
-        $self->threader->run( sub {
-            $self->_test_thread( $file );
-        }, 1 );
-    }
-
-    $self->finish;
-}
-
-sub _test_thread {
-    my $self = shift;
-    my ( $file ) = @_;
-
-    try {
-        $self->process_workflow(
-            $self->_init_workflow(
-                $self->_init_file( $file )
-            )
-        );
-    }
-    catch {
-        if ( $_ =~ m/SKIP:\s*(.*)/ ) {
-            Result->new(
-                pass => 0,
-                skip => $1,
-                file => $file->filename || "unknown file",
-                name => $file->filename || "unknown file",
-            )->write;
-        }
-        else {
-            Result->new(
-                pass => 0,
-                file => $file->filename || "unknown file",
-                name => $file->filename || "unknown file",
-                stderr => [ $_ ],
-            )->write;
-        }
-    };
-}
-
-sub _init_file {
-    my $self = shift;
-    my ( $file ) = @_;
-    $self->reset_benchmark;
-
-    return $file->load;
-}
-
-sub _init_workflow {
-    my $self = shift;
-    my ( $tclass ) = @_;
-    my $test = $tclass->fennec_new;
-    $test->fennec_meta->root_workflow->parent( $test );
-    return $test->fennec_meta->root_workflow;
-}
-
-sub process_workflow {
-    my $self = shift;
-    my ( $workflow ) = @_;
-
-    $self->reset_benchmark();
-    return unless $workflow->run_build_hooks();
-
-    my $testfile = $workflow->testfile;
-    return Result->skip_workflow( $testfile )
-        if $testfile->fennec_meta->skip;
-
-    try {
-        $workflow->build;
-        $self->reset_benchmark;
-        $workflow->run_tests( $self->search )
-    }
-    catch {
-        $testfile->fennec_meta->threader->finish;
-        Result->fail_workflow( $testfile, $_ );
-    };
-}
-
-sub start {
-    my $self = shift;
-    $self->collector->start;
-    $self->threader->iteration_callback( sub {
-        $self->collector->handle_output;
-        return unless $self->bail_out;
-        $self->threader->killall(15)
-    });
-    $self->threader->reap_callback( \&_reap_callback );
-    $self->_started(1);
-    Diag->new(
-        stderr => [
-            "** Reproduce this test order with this environment variable:",
-            "** FENNEC_SEED='@{[ $self->seed ]}'",
-        ],
-    )->write;
-}
-
-sub _reap_callback {
-    my ( $status, $pid, $ret ) = @_;
-    Result->new(
-        pass => 0,
-        name => "Child exit",
-        stderr => [ "Child ($pid) exited with non-zero status(@{[$status >> 8]})!" ],
-    )->write if $status;
-    Result->new(
-        pass => 0,
-        name => "Wait status",
-        stderr => [ "waitpid($pid) returned $ret!" ],
-    )->write if $pid != $ret;
-    return;
-}
-
-sub finish {
-    my $self = shift;
-    $self->$_() for @{ $self->finish_hooks || []};
-    $self->threader->finish;
-    $self->collector->finish;
-    $self->_finished(1);
-}
-
-sub add_finish_hook {
-    my $self = shift;
-    push @{ $self->{ finish_hooks }} => @_;
-}
-
-sub pid_changed {
-    my $self = shift;
-    my $pid = $$;
-    return 0 if $self->pid == $pid;
-    return $pid;
-}
-
-sub is_parent {
-    my $self = shift;
-    return if $self->pid_changed;
-    return ( $self->pid == $self->parent_pid ) ? 1 : 0;
-}
-
-sub is_subprocess {
-    my $self = shift;
-    return !$self->is_parent;
-}
-
-sub run_with_collector {
-    my $self = shift;
-    my ( $collector, $code ) = @_;
-    local $self->{ collector } = $collector;
-    return $code->();
-}
-
-sub reset_benchmark {
-    my $self = shift;
-    return $self->_benchmark_time( time )
-}
-
-sub benchmark {
-    my $self = shift;
-    my $old = $self->_benchmark_time;
-    unless ($old) {
-        $self->reset_benchmark;
+    if ( ref $item && ref $item eq 'CODE' ) {
+        $self->_load_guess($_) for ( $self->$item );
         return;
     }
-    my $new = $self->reset_benchmark;
-    return [( $new - $old )];
+
+    return $self->load_file($item)
+        if $item =~ m/\.(pm|t|pl|ft)$/i
+        || $item =~ m{/};
+
+    return $self->load_module($item)
+        if $item =~ m/::/
+        || $item =~ m/^\w[\w\d_]+$/;
+
+    die "Not sure how to load '$item'\n";
+}
+
+sub load_file {
+    my $self = shift;
+    my ($file) = @_;
+    print "Loading: $file\n";
+    eval { require $file; 1 } || $self->exception( $file, $@ );
+}
+
+sub load_module {
+    my $self   = shift;
+    my $module = shift;
+    print "Loading: $module\n";
+    eval { require_module $module } || $self->exception( $module, $@ );
+}
+
+sub check_pid {
+    my $self = shift;
+    return unless $self->pid != $$;
+    die "PID has changed! Did you forget to exit a child process?\n";
+}
+
+sub exception {
+    my $self = shift;
+    my ( $name, $exception ) = @_;
+
+    if ( $exception =~ m/^FENNEC_SKIP: (.*)\n/ ) {
+        $self->collector->ok( 1, "SKIPPING $name: $1" );
+        $self->_skip_all(1);
+    }
+    else {
+        $self->collector->ok( 0, $name );
+        $self->collector->diag($exception);
+    }
+}
+
+sub prunner {
+    my $self = shift;
+    my ($max) = @_;
+
+    my $runner = Parallel::Runner->new($max);
+
+    $runner->reap_callback(
+        sub {
+            my ( $status, $pid, $pid_again, $proc ) = @_;
+
+            # Status as returned from system, so 0 is good, 1+ is bad.
+            $self->exception( "Child process did not exit cleanly", "Status: $status" )
+                if $status;
+        }
+    );
+
+    $runner->iteration_callback( sub { $self->collector->collect } );
+
+    return $runner;
+}
+
+sub run {
+    my $self = shift;
+    my ($follow) = @_;
+
+    $self->_ran(1);
+
+    for my $class ( shuffle @{$self->test_classes} ) {
+        next unless $class;
+        $self->run_test_class($class);
+        $self->check_pid;
+    }
+
+    if ($follow) {
+        $self->collector->collect;
+        verbose_message("Entering final follow-up stage\n");
+        $follow->();
+    }
+
+    $self->collector->collect;
+    $self->collector->finish();
+}
+
+sub run_test_class {
+    my $self = shift;
+    my ($class) = @_;
+
+    return unless $class;
+
+    verbose_message("Entering workflow stage: $class\n");
+    return unless $class->can('TEST_WORKFLOW');
+
+    my $instance = $class->can('new') ? $class->new : bless( {}, $class );
+    my $ptests   = $self->prunner( $class->FENNEC->parallel );
+    my $pforce   = $class->FENNEC->parallel ? 1 : 0;
+    my $meta     = $instance->TEST_WORKFLOW;
+    my $orig_cwd = abs_path;
+
+    $meta->test_wait( sub { $ptests->finish } );
+    $meta->test_run(
+        sub {
+            my ($run) = @_;
+            $ptests->run(
+                sub {
+                    chdir $orig_cwd;
+                    local %ENV = %ENV;
+                    $run->();
+                    $self->collector->end_pid();
+                },
+                $pforce
+            );
+        }
+    );
+
+    Test::Workflow::run_tests($instance);
+    $ptests->finish;
+
+    if ( my $post = $class->FENNEC->post ) {
+        $self->collector->collect;
+        verbose_message("Entering follow-up stage: $class\n");
+        eval { $post->(); 1 } || $self->exception( 'done_testing', $@ );
+    }
 }
 
 sub DESTROY {
     my $self = shift;
-    return if $self->is_subprocess;
-    if( $self->_started && !$self->_finished ) {
-        warn <<EOT;
-Runner never finished!
-Did you forget to run done_testing() in a standalone test file?
-EOT
-    }
+    return unless $self->pid == $$;
+    return if $self->_ran;
+    return if $self->_skip_all;
+    return if $^C; # No warning in syntax check
+
+    my $tests = join "\n" => map { "#   * $_" } @{$self->test_classes};
+
+    print STDERR <<"    EOT";
+
+# *****************************************************************************
+# ERROR: done_testing() was never called!
+#
+# This usually means you ran a Fennec test file directly with prove or perl,
+# but the file does not call done_testing at the end.
+#
+# Fennec Tests loaded, but not run:
+$tests
+#
+# *****************************************************************************
+
+    EOT
+    exit(1);
+}
+
+# Set exit code to failed tests
+my $PID = $$;
+
+END {
+    return if $?;
+    return unless $SINGLETON;
+    return unless $PID == $$;
+    my $failed = $SINGLETON->collector->test_failed;
+    return unless $failed;
+    $? = $failed;
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Fennec::Runner - Responsible for Test::Workflow interaction
+
+=head1 DESCRIPTION
+
+Handles L<Test::Workflow> processing and concurrency. This class is a singleton
+instantiated by import() or new(), whichever comes first.
 
 =head1 AUTHORS
 
@@ -233,10 +274,10 @@ Chad Granum L<exodist7@gmail.com>
 
 =head1 COPYRIGHT
 
-Copyright (C) 2010 Chad Granum
+Copyright (C) 2013 Chad Granum
 
-Fennec is free software; Standard perl licence.
+Fennec is free software; Standard perl license.
 
 Fennec is distributed in the hope that it will be useful, but WITHOUT
 ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE.  See the license for more details.
+FOR A PARTICULAR PURPOSE. See the license for more details.
